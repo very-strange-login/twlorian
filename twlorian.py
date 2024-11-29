@@ -1,13 +1,13 @@
-from bs4 import BeautifulSoup
-import pandas as pd
-import requests
 import json
 import csv
 import random
 from concurrent.futures import ThreadPoolExecutor
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
 
 # List of user agents for the scraper to use
-user_agent = [
+USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36',
     'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36',
     'Mozilla/5.0 (Windows NT 5.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36',
@@ -20,127 +20,117 @@ user_agent = [
     'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36',
 ]
 
-username = input('Enter Twitter handle: ')
-print('Scraping tweet history for @' + username + '...')
+WAYBACK_BASE_URL = 'https://web.archive.org/web/0/'
 
-# Wayback Machine URL for the Twitter user's archive
-url = f"https://web.archive.org/web/timemap/?url=https%3A%2F%2Ftwitter.com%2F{username}%2F&matchType=prefix&collapse=urlkey&output=json&fl=original%2Cmimetype%2Ctimestamp%2Cendtimestamp%2Cgroupcount%2Cuniqcount&filter=!statuscode%3A%5B45%5D..&limit=100000&_=1627821432372"
+def fetch_archived_links(username):
+    """Fetch the archived tweet links for a given username from the Wayback Machine."""
+    url = (
+        f"https://web.archive.org/web/timemap/?url=https://twitter.com/{username}/"
+        "&matchType=prefix&collapse=urlkey&output=json"
+        "&fl=original,mimetype,timestamp,endtimestamp,groupcount,uniqcount"
+        "&filter=!statuscode:[45]..&limit=100000"
+    )
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()
+    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        print(f"Error fetching archived links: {e}")
+        return []
 
-# Set up a session to manage requests
-s = requests.Session()
-s.max_redirects = 10
+def scrape_tweet(archive_url, session, tweet_arr, not_found):
+    """Scrape a single tweet from an archived page and print selected fields."""
+    try:
+        session.headers['User-Agent'] = random.choice(USER_AGENTS)
+        response = session.get(archive_url)
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        tweets = soup.find_all('div', attrs={'data-item-type': 'tweet'}) or \
+                 soup.find_all('li', attrs={'data-item-type': 'tweet'})
 
-# Handling request and JSON decoding
-try:
-    resp = s.get(url)
-    if resp.status_code == 200:  # Ensure the response is OK
-        try:
-            txt = resp.json()  # Try parsing as JSON
-        except json.JSONDecodeError:
-            print(f"Error decoding JSON from the response for {url}")
-            print("Response content:", resp.text[:500])  # Print first 500 characters of response
-            txt = []  # Set empty list to avoid further issues
-    else:
-        print(f"Failed to fetch data from {url}, Status Code: {resp.status_code}")
-        txt = []
-except requests.exceptions.RequestException as e:
-    print(f"An error occurred: {e}")
-    txt = []
+        for tweet in tweets:
+            tweet_obj = extract_tweet_data(tweet)
+            if tweet_obj:
+                tweet_arr.append(tweet_obj)
+                # Print only the required fields
+                print(f"Tweet Text: {tweet_obj['tweet_text']}")
+                print(f"Screen Name: {tweet_obj['screen_name']}")
+                print(f"Timestamp: {tweet_obj['timestamp']}")
+                print("-" * 50)  # Divider for readability
+    except Exception as e:
+        print(f"Error scraping {archive_url}: {e}")
+        not_found.append(archive_url)
 
-if txt:
-    df = pd.DataFrame(txt)
-    df.to_csv(f"{username}_archivelinks.csv")
+def extract_tweet_data(tweet):
+    """Extract tweet data from a BeautifulSoup element."""
+    try:
+        tweet_obj = {
+            "tweet_id": tweet.get("data-item-id"),
+            "screen_name": tweet.get('data-screen-name'),
+            "permalink": tweet.get('data-permalink-path'),
+            "tweet_text": tweet.find('p', attrs={'class': 'tweet-text'}).text,
+            "user_id": tweet.get('data-user-id'),
+            "timestamp": tweet.find('span', attrs={'class': '_timestamp'}).get('data-time-ms'),
+            "hashtags": [
+                {
+                    "tag": ht.find('b').text,
+                    "archived_url": ht.get('href')
+                }
+                for ht in tweet.find_all('a', attrs={'class': 'twitter-hashtag'})
+            ],
+            "links": [
+                {
+                    "url": li.get('data-expanded-url') or li.get('data-resolved-url-large') or li.text,
+                    "archived_url": li.get('href')
+                }
+                for li in tweet.find_all('a', attrs={'class': 'twitter-timeline-link'})
+            ]
+        }
+        return tweet_obj
+    except AttributeError:
+        return None
 
-    links = df.iloc[1:, 0].values
+def save_results_to_files(username, tweet_arr):
+    """Save the tweet data to JSON and CSV files."""
+    with open(f"{username}_archive.json", 'w', encoding='utf-8') as json_file, \
+         open(f"{username}_archive.csv", 'w', newline='', encoding='utf-8') as csv_file:
+        json.dump(tweet_arr, json_file, ensure_ascii=False, indent=4)
+        csv_writer = csv.writer(csv_file, delimiter=';')
+        csv_writer.writerow(["tweet_id", "screen_name", "permalink", "tweet_text", "user_id", "timestamp"])
+        for tweet in tweet_arr:
+            csv_writer.writerow([
+                tweet['tweet_id'],
+                tweet['screen_name'],
+                tweet['permalink'],
+                tweet['tweet_text'],
+                tweet['user_id'],
+                tweet['timestamp']
+            ])
 
-    wayback = 'https://web.archive.org/web/0/'
-    archives = [wayback + x for x in links]
+def main():
+    username = input("Enter Twitter handle: ")
+    print(f"Scraping tweet history for @{username}...")
 
-    number_of_elements = len(archives)
+    archived_links = fetch_archived_links(username)
+    if not archived_links:
+        print("No archived links found.")
+        return
 
-    print('Number of tweets found:', number_of_elements, '\nArchiving tweets... (This could take a while.)')
+    df = pd.DataFrame(archived_links)
+    df.to_csv(f"{username}_archivelinks.csv", index=False)
 
-    tweet_arr = []
-    not_found = []
+    archives = [WAYBACK_BASE_URL + link for link in df.iloc[1:, 0].values]
+    print(f"Number of tweets found: {len(archives)}\nArchiving tweets...")
 
-    # Create JSON and CSV file writers
-    json_file = open(f"{username}_archive.json", 'a+', encoding='utf-8')
-    csv_file = open(f"{username}_archive.csv", 'a+', newline='', encoding='utf-8')
-    json_writer = json_file.write("[\n")
-    csv_writer = csv.writer(csv_file, delimiter=';')
+    tweet_arr, not_found = [], []
+    with ThreadPoolExecutor() as executor, requests.Session() as session:
+        futures = [executor.submit(scrape_tweet, archive, session, tweet_arr, not_found) for archive in archives]
+        for future in futures:
+            future.result()
 
-    def scrape_tweet(archive):
-        try:
-            s.headers['User-Agent'] = random.choice(user_agent)
-            l = s.get(archive)
-            l.encoding = 'utf-8'
-            html_content = l.text
-            soup = BeautifulSoup(html_content, 'html.parser')
-            tweets = soup.find_all('div', attrs={'data-item-type': 'tweet'})
+    print(f"Number of tweets archived: {len(tweet_arr)}")
+    print(f"Number of tweets not found: {len(not_found)}")
+    save_results_to_files(username, tweet_arr)
 
-            if not tweets:
-                tweets = soup.find_all('li', attrs={'data-item-type': 'tweet'})
-
-            for t in tweets:
-                tweet_obj = {}
-
-                if 'data-item-id' in t.attrs:
-                    tweet_obj['tweet_id'] = t.get("data-item-id")
-                    tweet_container = t.find('div', attrs={'class': 'tweet'})
-                    tweet_obj['screen_name'] = tweet_container.get('data-screen-name')
-                    tweet_obj['permalink'] = tweet_container.get('data-permalink-path')
-                    tweet_content = tweet_container.find('p', attrs={'class': 'tweet-text'})
-                    tweet_obj['tweet_text'] = tweet_content.text
-                    tweet_obj['user_id'] = tweet_container.get('data-user-id')
-                    tweet_time = tweet_container.find('span', attrs={'class': '_timestamp'})
-                    tweet_obj['timestamp'] = tweet_time.get('data-time-ms')
-                    hashtags = tweet_container.find_all('a', attrs={'class': 'twitter-hashtag'})
-                    tweet_obj['hashtags'] = []
-                    tweet_obj['links'] = []
-
-                    for ht in hashtags:
-                        ht_obj = {'tag': ht.find('b').text, 'archived_url': ht.get('href')}
-                        tweet_obj['hashtags'].append(ht_obj)
-
-                    links = tweet_container.find_all('a', attrs={'class': 'twitter-timeline-link'})
-                    for li in links:
-                        li_obj = {}
-
-                        if li.get('data-expanded-url'):
-                            li_obj['url'] = li.get('data-expanded-url')
-                        elif li.get('data-resolved-url-large'):
-                            li_obj['url'] = li.get('data-resolved-url-large')
-                        else:
-                            li_obj['url'] = li.text
-
-                        li_obj['archived_url'] = li.get('href')
-                        tweet_obj['links'].append(li_obj)
-
-                    tweet_arr.append(tweet_obj)
-                    print(tweet_obj)
-                    # Write tweet_obj to JSON file
-                    json_writer.write(json.dumps(tweet_obj, ensure_ascii=False, sort_keys=True, indent=4) + ",\n")
-
-                    # Write tweet_obj to CSV file
-                    csv_writer.writerow([tweet_obj['tweet_id'], tweet_obj['screen_name'], tweet_obj['permalink'], tweet_obj['tweet_text'], tweet_obj['user_id'], tweet_obj['timestamp']])
-
-        except requests.exceptions.TooManyRedirects:
-            pass
-        except:
-            not_found.append(archive)
-
-    with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(scrape_tweet, archive) for archive in archives]
-
-    number_found = len(tweet_arr)
-    number_notfound = len(not_found)
-
-    print('Number of tweets archived: ', number_found)
-    print('Number of tweets not found: ', number_notfound)
-
-    # Close files properly
-    json_file.close()
-    csv_file.close()
-
-else:
-    print("No data to process.")
+if __name__ == "__main__":
+    main()
